@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="robots" content="noindex" />
+  <title>收款确认后台</title>
+  <link rel="stylesheet" href="/style.css" />
+  <style>
+    main { max-width: 640px; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+    .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px; text-align: center; }
+    .stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+    .stat span { font-size: 12px; color: var(--muted); }
+    .tabs { display: flex; gap: 6px; margin-bottom: 10px; align-items: center; }
+    .tabs .spacer { flex: 1; }
+    .order { display: flex; align-items: center; gap: 12px; }
+    .order.claimed { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary) inset; }
+    .order .code { font-size: 26px; font-weight: 700; letter-spacing: 2px; font-variant-numeric: tabular-nums; min-width: 72px; }
+    .order .info { flex: 1; min-width: 0; font-size: 13px; color: var(--muted); }
+    .order .info .st { font-size: 14px; font-weight: 600; color: var(--fg); }
+    .order .ops { display: flex; flex-direction: column; gap: 6px; }
+    .badge { display: inline-block; padding: 0 6px; border-radius: 6px; font-size: 12px; margin-left: 4px; }
+    .b-claimed { background: var(--primary); color: #fff; }
+    .b-pending { background: var(--line); color: var(--fg); }
+    .b-paid { background: #16a34a; color: #fff; }
+    .b-rejected { background: #dc2626; color: #fff; }
+    .b-cancelled { background: var(--line); color: var(--muted); }
+    .empty { text-align: center; color: var(--muted); padding: 24px 0; }
+    #login .row { margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>💰 收款确认</h1>
+
+    <section class="card" id="login" hidden>
+      <div>请输入管理口令（.env 里的 ADMIN_TOKEN）</div>
+      <div class="row">
+        <input id="tokenInput" type="password" autocomplete="current-password" placeholder="管理口令" />
+        <button id="btnLogin">进入</button>
+      </div>
+    </section>
+
+    <div id="panel" hidden>
+      <div class="stats">
+        <div class="stat"><b id="sSpins">-</b><span>今日转盘</span></div>
+        <div class="stat"><b id="sOrders">-</b><span>今日确认单数</span></div>
+        <div class="stat"><b id="sTotal">-</b><span>今日收款(¥)</span></div>
+      </div>
+      <div class="tabs">
+        <button class="chip on" data-scope="open">待处理</button>
+        <button class="chip" data-scope="all">最近 100 单</button>
+        <span class="spacer"></span>
+        <button class="link" id="btnLogout">退出</button>
+      </div>
+      <p class="muted">核对收款记录里的<b>转账备注</b>和金额，再点「确认到账」。橙色框是用户已点「我已付款」的单。</p>
+      <div id="list"></div>
+    </div>
+  </main>
+  <div class="toast" id="toast" hidden></div>
+  <script src="/admin.js"></script>
+</body>
+</html>

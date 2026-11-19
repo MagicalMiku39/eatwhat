@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>今天吃什么</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main>
+    <h1>🍜 今天吃什么</h1>
+
+    <section class="card">
+      <div class="row">
+        <span class="loc" id="locLabel">未定位</span>
+        <button class="link" id="btnLocate">重新定位</button>
+      </div>
+      <div class="row">
+        <input id="addrInput" placeholder="或输入地址，如：国贸大厦" />
+        <button class="ghost" id="btnAddr">用此地址</button>
+      </div>
+      <div class="row">
+        <label for="radius">范围</label>
+        <select id="radius">
+          <option value="500">500 米</option>
+          <option value="1000" selected>1 公里</option>
+          <option value="2000">2 公里</option>
+          <option value="3000">3 公里</option>
+        </select>
+        <label for="minRating">评分</label>
+        <select id="minRating">
+          <option value="0">不限</option>
+          <option value="3.5">3.5 分以上</option>
+          <option value="4" selected>4.0 分以上</option>
+          <option value="4.5">4.5 分以上</option>
+        </select>
+      </div>
+      <div class="chips" id="chips"></div>
+    </section>
+
+    <details class="card fav">
+      <summary>★ 常去的店 <span class="muted" id="favSummary"></span></summary>
+      <p class="muted small">加了常去的店后，转盘 = 范围内的常去店 + 同样数量的随机店（随机的店受评分筛选，常去的店不受）。</p>
+      <div id="favList"><p class="muted small">定位后显示</p></div>
+      <div class="row fav-search">
+        <input id="favInput" placeholder="在当前范围内搜店名，如：海底捞" />
+        <button class="ghost" id="btnFavSearch">搜索</button>
+      </div>
+      <div id="favResults"></div>
+    </details>
+
+    <section class="wheel-wrap">
+      <div class="pointer"></div>
+      <canvas id="wheel"></canvas>
+      <button id="btnSpin" class="spin">转!</button>
+    </section>
+    <p class="wheel-info">
+      <span id="wheelInfo"></span>
+      <button class="link" id="btnReshuffle" hidden>换一批</button>
+    </p>
+
+    <p class="status" id="status"></p>
+    <button id="btnBuy" class="buy" hidden></button>
+
+    <section class="card result" id="result" hidden></section>
+    <p class="muted center" id="demoTip" hidden>⚠️ 当前为演示数据（服务端未配置 AMAP_KEY）</p>
+  </main>
+
+  <div class="modal" id="payModal" hidden>
+    <div class="modal-box">
+      <h3 id="payTitle">扫码支付，再转一次</h3>
+      <div class="qr" id="qrBox"></div>
+      <p class="pay-amount" id="payAmount"></p>
+      <p class="pay-code">转账备注：<b id="payCode"></b></p>
+      <p class="muted" id="payHint"></p>
+      <div class="pay-actions">
+        <button id="btnClaim">我已付款</button>
+        <button id="btnMockPay">模拟支付成功</button>
+        <button class="ghost" id="btnPayCancel">取消订单</button>
+        <button class="ghost" id="btnPayClose">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>
