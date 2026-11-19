@@ -52,9 +52,24 @@ function offsetPoint(lng, lat, meters, angle) {
 
 // 全局串行 + 限速：个人开发者 Key 约 3 QPS，超了会报 CUQPS_HAS_EXCEEDED_THE_LIMIT(10021)
 const MIN_INTERVAL = 380;
+// 排队上限：约 6 秒的量。超了直接告诉用户「忙」，而不是无限排队拖垮所有人
+const MAX_PENDING = 15;
 let queue = Promise.resolve();
 let lastCall = 0;
+let pending = 0;
+
+function amapError(status, code, message) {
+  const err = new Error(message);
+  err.status = status;
+  err.code = code;
+  return err;
+}
+
 function throttled(fn) {
+  if (pending >= MAX_PENDING) {
+    return Promise.reject(amapError(503, 'busy', '查询的人太多了，请稍后再试'));
+  }
+  pending++;
   const run = queue.then(async () => {
     const wait = lastCall + MIN_INTERVAL - Date.now();
     if (wait > 0) await sleep(wait);
@@ -62,7 +77,7 @@ function throttled(fn) {
     return fn();
   });
   queue = run.catch(() => {});
-  return run;
+  return run.finally(() => pending--);
 }
 
 const QPS_CODES = new Set(['10019', '10020', '10021']);
@@ -74,17 +89,22 @@ async function amapGet(path, params) {
   let data;
   for (let attempt = 0; ; attempt++) {
     data = await throttled(async () => {
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      return res.json();
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        return await res.json();
+      } catch (e) {
+        console.error('AMAP request failed:', e.message);
+        throw amapError(502, 'amap_unavailable', '地图服务暂时连不上，请稍后再试');
+      }
     });
     if (data.status === '1' || !QPS_CODES.has(data.infocode) || attempt >= 2) break;
     await sleep(1000 * (attempt + 1));
   }
   if (data.status !== '1') {
-    const err = new Error(`高德接口错误: ${data.info || 'unknown'} (${data.infocode || ''})`);
-    err.status = 502;
-    err.code = 'amap_error';
-    throw err;
+    // 具体原因（可能涉及 Key 配置）只写服务器日志，不返回给用户
+    console.error(`AMAP error: ${data.info} (${data.infocode})`);
+    const quota = /DAILY_QUERY_OVER_LIMIT|ACCESS_TOO_FREQUENT|EXCEEDED/.test(data.info || '');
+    throw amapError(502, 'amap_error', quota ? '今天的地图查询额度用完了，明天再来吧' : '地图服务出错了，请稍后再试');
   }
   return data;
 }
@@ -143,6 +163,16 @@ export async function getPool({ lng, lat, radius, category }) {
   const ck = `${lng.toFixed(3)},${lat.toFixed(3)}|${radius}|${category}`;
   const hit = cache.get(ck);
   if (hit && Date.now() - hit.at < CACHE_TTL) return { demo: false, pool: hit.pool };
+  // 同一个查询正在进行中就共用它，不重复打高德
+  if (inflight.has(ck)) return inflight.get(ck);
+  const p = fetchPool({ lng, lat, radius, category }, ck).finally(() => inflight.delete(ck));
+  inflight.set(ck, p);
+  return p;
+}
+
+const inflight = new Map();
+
+async function fetchPool({ lng, lat, radius, category }, ck) {
 
   const cat = CATEGORIES[category] || CATEGORIES.all;
   const seen = new Map();

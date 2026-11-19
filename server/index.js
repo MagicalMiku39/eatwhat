@@ -9,6 +9,7 @@ import * as db from './db.js';
 import { getPool, geocode, searchNearby, matchesCategory, distanceM, shuffle, CATEGORIES } from './amap.js';
 import { wgs84ToGcj02 } from './geo.js';
 import { config } from './config.js';
+import * as rl from './ratelimit.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC = path.join(ROOT, 'public');
@@ -33,23 +34,69 @@ class HttpError extends Error {
 // 东八区日期，作为「每天」的边界
 const today = () => new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
 
+/**
+ * 客户端真实 IP。
+ * 在 nginx 后面（TRUST_PROXY=1）时取 X-Forwarded-For 的「最后一个」：
+ * nginx 的 $proxy_add_x_forwarded_for 会把它看到的真实来源 IP 追加到末尾，
+ * 前面的部分是客户端自己发来的，可以随便伪造，绝不能信。
+ */
 function clientIp(req) {
   if (config.trustProxy) {
-    const xff = req.headers['x-forwarded-for'];
-    if (xff) return String(xff).split(',')[0].trim();
+    const xff = String(req.headers['x-forwarded-for'] || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (xff.length) return xff[xff.length - 1].replace(/^::ffff:/, '');
   }
   return (req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
 }
 
-/** 设备 ID 放 cookie；没有就新发一个 */
+/** 这次请求是不是 HTTPS（直连 HTTPS，或经过 nginx 的 HTTPS） */
+const isHttps = (req) =>
+  Boolean(req.socket.encrypted) || (config.trustProxy && req.headers['x-forwarded-proto'] === 'https');
+
+/** 设备 ID 放 cookie；没有就新发一个。HTTPS 下加 Secure，cookie 不会走明文 HTTP */
 function identify(req, res) {
   const m = /(?:^|;\s*)did=([0-9a-f-]{36})/.exec(req.headers.cookie || '');
   let device = m?.[1];
   if (!device) {
     device = crypto.randomUUID();
-    res.setHeader('Set-Cookie', `did=${device}; Path=/; Max-Age=315360000; HttpOnly; SameSite=Lax`);
+    const secure = isHttps(req) ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `did=${device}; Path=/; Max-Age=315360000; HttpOnly; SameSite=Lax${secure}`);
   }
   return { ip: clientIp(req), device };
+}
+
+/** 安全响应头：禁止被嵌入别的网页（防点击劫持）、只加载本站脚本、禁止 MIME 嗅探等 */
+function setSecurityHeaders(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'geolocation=(self), camera=(), microphone=(), payment=()');
+  res.setHeader(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'", // admin.html 有内联样式；不允许内联脚本
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "object-src 'none'",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+    ].join('; ')
+  );
+  if (isHttps(req)) res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+}
+
+/** 解码网址片段；格式错误的网址按 400 处理，而不是 500 */
+function decodePath(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    throw new HttpError(400, 'bad_url', '网址格式错误');
+  }
 }
 
 async function readJson(req) {
@@ -173,7 +220,10 @@ const chanceCtx = (id) => ({
   freePerDay: config.freePerDay,
 });
 
-const publicOrder = (o) => (o ? { orderId: o.id, code: o.code, amount: o.amount, status: o.status } : null);
+const publicOrder = (o) =>
+  o ? { orderId: o.id, code: o.code, amount: o.amount, status: db.effectiveStatus(o) } : null;
+
+const MAX_ACTIVE_ORDERS_PER_IP = 10;
 
 const qrPath = () => path.resolve(ROOT, config.payQrFile);
 const QR_MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
@@ -193,25 +243,57 @@ function ownOrder(id, orderId) {
   return o;
 }
 
-function requireAdmin(req) {
+// 口令错误 10 次（15 分钟内）锁定该 IP 15 分钟；并发猜也一样计数
+const ADMIN_MAX_FAILS = 10;
+const ADMIN_LOCK_MS = 15 * 60e3;
+
+function requireAdmin(req, id) {
   if (!config.adminToken) throw new HttpError(503, 'admin_disabled', '管理后台未启用：请在 .env 设置 ADMIN_TOKEN');
+  const locked = rl.blockedFor('adminfail', id.ip, ADMIN_MAX_FAILS);
+  if (locked) {
+    throw new HttpError(429, 'admin_locked', `口令错误次数太多，已锁定，请 ${MIN(locked)} 分钟后再试`);
+  }
   const given = String(req.headers['x-admin-token'] || '');
   const a = crypto.createHash('sha256').update(given).digest();
   const b = crypto.createHash('sha256').update(config.adminToken).digest();
-  if (!crypto.timingSafeEqual(a, b)) throw new HttpError(401, 'bad_token', '口令错误');
+  if (!crypto.timingSafeEqual(a, b)) {
+    rl.hit('adminfail', id.ip, ADMIN_MAX_FAILS, ADMIN_LOCK_MS);
+    console.warn(`[admin] wrong token from ${id.ip}`);
+    throw new HttpError(401, 'bad_token', '口令错误');
+  }
 }
 
 const adminOrder = (o) => ({
   orderId: o.id,
   code: o.code,
   amount: o.amount,
-  status: o.status,
+  status: db.effectiveStatus(o),
   ip: o.ip,
   device: o.device.slice(0, 8),
   createdAt: o.created_at,
   claimedAt: o.claimed_at,
   handledAt: o.handled_at,
 });
+
+// ---- 限流（按 IP）----
+// 公司出口 IP 可能被很多人共用，所以额度给得比较宽；目的是挡住脚本刷接口，不是限制正常使用。
+const LIMITS = {
+  api: [180, 60e3], // 所有接口：每分钟 180 次
+  amap: [30, 60e3], // 会调高德的接口（组盘/搜索/地址解析）：每分钟 30 次
+  order: [20, 3600e3], // 下单：每小时 20 次
+};
+const MIN = (n) => Math.ceil(n / 60);
+
+function limit(name, ip) {
+  const [max, windowMs] = LIMITS[name];
+  const wait = rl.hit(name, ip, max, windowMs);
+  if (wait) {
+    const e = new HttpError(429, 'rate_limited', `操作太频繁了，请 ${wait < 90 ? `${wait} 秒` : `${MIN(wait)} 分钟`}后再试`);
+    e.retryAfter = wait;
+    throw e;
+  }
+}
+const AMAP_ROUTES = new Set(['POST /api/wheel', 'POST /api/search', 'GET /api/geocode']);
 
 const routes = {
   'GET /api/meta': async (req, res, id) => ({
@@ -280,6 +362,14 @@ const routes = {
   // manual：用户扫管理员收款码转账（备注 4 位码）→ 点「我已付款」→ 管理员后台确认 → 加 1 次
   // 接入真实支付时：新增 POST /api/pay/notify，验签 + 校验金额后调用 db.markPaid(orderId)（已幂等）
   'POST /api/orders': async (req, res, id) => {
+    // 已有未完成的单就直接返回，不算次数
+    const existing = db.openOrderFor(id.device);
+    if (existing) return publicOrder(existing);
+    // 防刷单：每个 IP 每小时下单次数有限，同时挂着的未完成订单也有上限
+    limit('order', id.ip);
+    if (db.activeOrdersByIp(id.ip) >= MAX_ACTIVE_ORDERS_PER_IP) {
+      throw new HttpError(429, 'too_many_orders', '当前网络下待处理的订单太多了，请等管理员处理后再试');
+    }
     const orderId = 'O' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
     const o = db.createOrder({ id: orderId, device: id.device, ip: id.ip, amount: config.orderAmount });
     return publicOrder(o);
@@ -289,7 +379,9 @@ const routes = {
 
   'POST /api/orders/:id/claim': async (req, res, id, url, params) => {
     const o = ownOrder(id, params.id);
-    db.claimOrder(o.id);
+    if (!db.claimOrder(o.id) && db.effectiveStatus(db.getOrder(o.id)) === 'expired') {
+      throw new HttpError(410, 'order_expired', '这笔订单超过 30 分钟已失效。如果已经付了款，请直接联系管理员');
+    }
     return publicOrder(db.getOrder(o.id));
   },
 
@@ -308,20 +400,24 @@ const routes = {
 
   // ---- 管理后台（请求头 X-Admin-Token）----
   'GET /api/admin/orders': async (req, res, id, url) => {
-    requireAdmin(req);
+    requireAdmin(req, id);
     const scope = url.searchParams.get('scope') === 'all' ? 'all' : 'open';
-    return { orders: db.listOrders(scope).map(adminOrder), stats: db.todayStats(today()) };
+    return {
+      orders: db.listOrders(scope).map(adminOrder),
+      pendingCount: db.pendingOrderCount(),
+      stats: db.todayStats(today()),
+    };
   },
 
   'POST /api/admin/orders/:id/confirm': async (req, res, id, url, params) => {
-    requireAdmin(req);
+    requireAdmin(req, id);
     if (!db.getOrder(params.id)) throw new HttpError(404, 'no_order', '订单不存在');
     const ok = db.markPaid(params.id);
     return { ok, order: adminOrder(db.getOrder(params.id)) };
   },
 
   'POST /api/admin/orders/:id/reject': async (req, res, id, url, params) => {
-    requireAdmin(req);
+    requireAdmin(req, id);
     if (!db.getOrder(params.id)) throw new HttpError(404, 'no_order', '订单不存在');
     const ok = db.rejectOrder(params.id);
     return { ok, order: adminOrder(db.getOrder(params.id)) };
@@ -330,7 +426,7 @@ const routes = {
 
 function matchRoute(method, pathname) {
   const exact = routes[`${method} ${pathname}`];
-  if (exact) return { handler: exact, params: {} };
+  if (exact) return { handler: exact, params: {}, key: `${method} ${pathname}` };
   for (const key of Object.keys(routes)) {
     const [m, pattern] = key.split(' ');
     if (m !== method || !pattern.includes(':')) continue;
@@ -338,15 +434,15 @@ function matchRoute(method, pathname) {
     const ap = pathname.split('/');
     if (pp.length !== ap.length) continue;
     const params = {};
-    if (pp.every((seg, i) => (seg.startsWith(':') ? ((params[seg.slice(1)] = decodeURIComponent(ap[i])), true) : seg === ap[i]))) {
-      return { handler: routes[key], params };
+    if (pp.every((seg, i) => (seg.startsWith(':') ? ((params[seg.slice(1)] = decodePath(ap[i])), true) : seg === ap[i]))) {
+      return { handler: routes[key], params, key };
     }
   }
   return null;
 }
 
-function sendJson(res, status, data) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+function sendJson(res, status, data, extraHeaders = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extraHeaders });
   res.end(JSON.stringify(data));
 }
 
@@ -362,12 +458,15 @@ function serveStatic(req, res, pathname) {
 }
 
 const handler = async (req, res) => {
-  const url = new URL(req.url, 'http://localhost');
+  setSecurityHeaders(req, res);
   try {
+    const url = new URL(req.url, 'http://localhost');
     if (url.pathname.startsWith('/api/')) {
       const found = matchRoute(req.method, url.pathname);
       if (!found) throw new HttpError(404, 'not_found', 'Not found');
       const id = identify(req, res);
+      limit('api', id.ip);
+      if (AMAP_ROUTES.has(found.key)) limit('amap', id.ip);
       return sendJson(res, 200, await found.handler(req, res, id, url, found.params));
     }
     if (req.method !== 'GET') throw new HttpError(405, 'method', 'Method not allowed');
@@ -387,11 +486,19 @@ const handler = async (req, res) => {
       });
       return fs.createReadStream(qrPath()).pipe(res);
     }
-    serveStatic(req, res, decodeURIComponent(url.pathname));
+    serveStatic(req, res, decodePath(url.pathname));
   } catch (e) {
-    if (!(e instanceof HttpError) && !e.code) console.error(e);
+    // 只有我们自己定义的错误（带 status）才把提示返回给用户；其他内部错误只写日志，不外泄细节
+    const known = e instanceof HttpError || (e.status && e.code);
+    if (!known) console.error(e);
     if (e.code === 'bad_token') await new Promise((r) => setTimeout(r, 1000)); // 拖慢口令爆破
-    sendJson(res, e.status || 500, { error: e.code || 'server_error', message: e.message || '服务器错误' });
+    if (res.headersSent) return res.destroy();
+    sendJson(
+      res,
+      known ? e.status : 500,
+      { error: known ? e.code : 'server_error', message: known ? e.message : '服务器出错了，请稍后再试' },
+      e.retryAfter ? { 'Retry-After': String(e.retryAfter) } : {}
+    );
   }
 };
 
@@ -403,7 +510,10 @@ const lanIps = () =>
     .filter((a) => a.family === 'IPv4' && !a.internal && !/^(169\.254|198\.1[89])\./.test(a.address))
     .map((a) => a.address);
 
-http.createServer(handler).listen(config.port, () => {
+// 超时设短一些：防止慢速请求（故意一点点发数据）长时间占着连接
+const SERVER_OPTS = { requestTimeout: 30e3, headersTimeout: 15e3, keepAliveTimeout: 5e3 };
+
+http.createServer(SERVER_OPTS, handler).listen(config.port, () => {
   console.log(`HTTP : http://localhost:${config.port}`);
 });
 
@@ -411,7 +521,7 @@ const certFile = path.join(CERTS, 'server.crt');
 const keyFile = path.join(CERTS, 'server.key');
 if (config.httpsPort && fs.existsSync(certFile) && fs.existsSync(keyFile)) {
   https
-    .createServer({ cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) }, handler)
+    .createServer({ ...SERVER_OPTS, cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) }, handler)
     .listen(config.httpsPort, () => {
       console.log(`HTTPS: https://localhost:${config.httpsPort}`);
       for (const ip of lanIps()) console.log(`       https://${ip}:${config.httpsPort}   <- 手机用这个（同一 WiFi）`);

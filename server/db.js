@@ -48,7 +48,10 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status, created
  *   cancelled 用户取消
  */
 const OPEN = "status IN ('pending', 'claimed')";
-const ORDER_TTL = 24 * 3600e3; // 超过 24 小时的未完成订单视为过期，不再展示
+// 「有效」的未完成订单：没点「我已付款」的单 30 分钟自动失效（防刷单占位），点了的保留 24 小时等管理员处理
+const PENDING_TTL = 30 * 60e3;
+const CLAIMED_TTL = 24 * 3600e3;
+const ACTIVE = "((status = 'pending' AND created_at > ?) OR (status = 'claimed' AND created_at > ?))";
 
 const q = {
   used: db.prepare('SELECT n FROM free_spins WHERE day = ? AND key = ?'),
@@ -65,17 +68,21 @@ const q = {
   ),
   getOrder: db.prepare('SELECT * FROM orders WHERE id = ?'),
   openOrderFor: db.prepare(
-    `SELECT * FROM orders WHERE device = ? AND ${OPEN} AND created_at > ? ORDER BY created_at DESC LIMIT 1`
+    `SELECT * FROM orders WHERE device = ? AND ${ACTIVE} ORDER BY created_at DESC LIMIT 1`
   ),
-  codeInUse: db.prepare(`SELECT 1 FROM orders WHERE code = ? AND ${OPEN} AND created_at > ?`),
-  claim: db.prepare("UPDATE orders SET status = 'claimed', claimed_at = ? WHERE id = ? AND status = 'pending'"),
+  codeInUse: db.prepare(`SELECT 1 FROM orders WHERE code = ? AND ${ACTIVE}`),
+  activeByIp: db.prepare(`SELECT COUNT(*) AS n FROM orders WHERE ip = ? AND ${ACTIVE}`),
+  claim: db.prepare(
+    "UPDATE orders SET status = 'claimed', claimed_at = ? WHERE id = ? AND status = 'pending' AND created_at > ?"
+  ),
   cancel: db.prepare("UPDATE orders SET status = 'cancelled', handled_at = ? WHERE id = ? AND status = 'pending'"),
   pay: db.prepare(`UPDATE orders SET status = 'paid', paid_at = ?, handled_at = ? WHERE id = ? AND ${OPEN}`),
   reject: db.prepare(`UPDATE orders SET status = 'rejected', handled_at = ? WHERE id = ? AND ${OPEN}`),
-  listOpen: db.prepare(
-    `SELECT * FROM orders WHERE ${OPEN} AND created_at > ?
-     ORDER BY (status = 'claimed') DESC, COALESCE(claimed_at, created_at) DESC LIMIT 200`
+  // 管理员默认只看「用户说已付款」的单；没点已付款的单只显示个数，不刷屏
+  listClaimed: db.prepare(
+    "SELECT * FROM orders WHERE status = 'claimed' AND created_at > ? ORDER BY claimed_at DESC LIMIT 200"
   ),
+  pendingCount: db.prepare("SELECT COUNT(*) AS n FROM orders WHERE status = 'pending' AND created_at > ?"),
   listRecent: db.prepare('SELECT * FROM orders ORDER BY created_at DESC LIMIT 100'),
   spinStats: db.prepare('SELECT source, COUNT(*) AS n FROM spin_logs WHERE day = ? GROUP BY source'),
   paidStats: db.prepare(
@@ -110,7 +117,8 @@ const tx = (fn) => {
     throw e;
   }
 };
-const since = () => Date.now() - ORDER_TTL;
+// ACTIVE 条件需要的两个时间点
+const activeArgs = () => [Date.now() - PENDING_TTL, Date.now() - CLAIMED_TTL];
 
 export function getStatus({ day, ip, device, mode, freePerDay }) {
   const used = usedMax(day, keysFor(mode, ip, device));
@@ -138,18 +146,22 @@ export function logSpin({ day, device, ip, source, poi }) {
 }
 
 export const getOrder = (id) => q.getOrder.get(id);
-export const openOrderFor = (device) => q.openOrderFor.get(device, since());
+/** 对外展示的状态：没点「我已付款」又超过 30 分钟的单显示为 expired */
+export const effectiveStatus = (o) =>
+  o.status === 'pending' && o.created_at <= Date.now() - PENDING_TTL ? 'expired' : o.status;
+export const openOrderFor = (device) => q.openOrderFor.get(device, ...activeArgs());
+export const activeOrdersByIp = (ip) => q.activeByIp.get(ip, ...activeArgs()).n;
 
 /** 建单；同一设备已有未完成订单时直接返回那一单（防止刷单） */
 export function createOrder({ id, device, ip, amount }) {
   return tx(() => {
-    const existing = q.openOrderFor.get(device, since());
+    const existing = q.openOrderFor.get(device, ...activeArgs());
     if (existing) return existing;
-    // 4 位数字备注码，方便转账时填写、管理员核对；只需在未完成订单里唯一
+    // 4 位数字备注码，方便转账时填写、管理员核对；只需在有效订单里唯一
     let code;
     for (let i = 0; i < 50; i++) {
       const c = String(1000 + Math.floor(Math.random() * 9000));
-      if (!q.codeInUse.get(c, since())) {
+      if (!q.codeInUse.get(c, ...activeArgs())) {
         code = c;
         break;
       }
@@ -160,7 +172,7 @@ export function createOrder({ id, device, ip, amount }) {
   });
 }
 
-export const claimOrder = (id) => q.claim.run(Date.now(), id).changes > 0;
+export const claimOrder = (id) => q.claim.run(Date.now(), id, Date.now() - PENDING_TTL).changes > 0;
 export const cancelOrder = (id) => q.cancel.run(Date.now(), id).changes > 0;
 
 /** 确认到账并加 1 次机会。幂等：同一订单只会入账一次 */
@@ -177,7 +189,9 @@ export function markPaid(orderId) {
 
 export const rejectOrder = (id) => q.reject.run(Date.now(), id).changes > 0;
 
-export const listOrders = (scope) => (scope === 'all' ? q.listRecent.all() : q.listOpen.all(since()));
+export const listOrders = (scope) =>
+  scope === 'all' ? q.listRecent.all() : q.listClaimed.all(Date.now() - CLAIMED_TTL);
+export const pendingOrderCount = () => q.pendingCount.get(Date.now() - PENDING_TTL).n;
 
 export function todayStats(day) {
   const spins = { free: 0, paid: 0 };

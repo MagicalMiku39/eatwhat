@@ -25,7 +25,7 @@
     .b-pending { background: var(--line); color: var(--fg); }
     .b-paid { background: #16a34a; color: #fff; }
     .b-rejected { background: #dc2626; color: #fff; }
-    .b-cancelled { background: var(--line); color: var(--muted); }
+    .b-cancelled, .b-expired { background: var(--line); color: var(--muted); }
     .empty { text-align: center; color: var(--muted); padding: 24px 0; }
     #login .row { margin-top: 8px; }
   </style>
@@ -49,7 +49,7 @@
         <div class="stat"><b id="sTotal">-</b><span>今日收款(¥)</span></div>
       </div>
       <div class="tabs">
-        <button class="chip on" data-scope="open">待处理</button>
+        <button class="chip on" data-scope="open">待确认</button>
         <button class="chip" data-scope="all">最近 100 单</button>
         <span class="spacer"></span>
         <button class="link" id="btnLogout">退出</button>

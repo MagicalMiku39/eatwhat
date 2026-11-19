@@ -408,7 +408,7 @@
 
   // ---------- 支付 ----------
   // manual 模式：扫管理员收款码转账（备注 4 位码）→「我已付款」→ 管理员后台确认 → 自动加次数
-  const FINAL = ['paid', 'rejected', 'cancelled'];
+  const FINAL = ['paid', 'rejected', 'cancelled', 'expired'];
   let pollTimer;
 
   function renderPayModal() {
@@ -433,7 +433,7 @@
     $('payHint').textContent = claimed
       ? '已通知管理员，确认到账后会自动加 1 次机会，可以先关掉这个窗口。'
       : manual
-        ? '转账时请备注上面的 4 位数字，付完点「我已付款」。'
+        ? '转账时请备注上面的 4 位数字，付完点「我已付款」。请在 30 分钟内完成，超时订单自动失效。'
         : '';
     $('btnClaim').hidden = !manual || claimed;
     $('btnMockPay').hidden = manual || claimed;
@@ -461,6 +461,7 @@
       $('payModal').hidden = true;
       if (o.status === 'paid') toast('付款已确认，获得 1 次机会！');
       else if (o.status === 'rejected') toast(`订单 ${o.code} 没有确认到账，有疑问请联系管理员`);
+      else if (o.status === 'expired') toast(`订单 ${o.code} 超过 30 分钟已失效`);
       await refreshStatus();
     } else if (o.status !== prev) {
       state.order = o;
@@ -494,6 +495,11 @@
       renderPayModal();
       renderStatus();
     } catch (e) {
+      if (e.code === 'order_expired') {
+        trackOrder(null);
+        $('payModal').hidden = true;
+        await refreshStatus();
+      }
       toast(e.message);
     }
   }

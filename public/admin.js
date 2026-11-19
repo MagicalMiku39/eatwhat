@@ -6,6 +6,7 @@
     paid: '已确认',
     rejected: '已拒绝',
     cancelled: '已取消',
+    expired: '已失效',
   };
   const store = {
     get: () => {
@@ -62,7 +63,7 @@
     return e;
   }
 
-  function render({ orders, stats }) {
+  function render({ orders, stats, pendingCount }) {
     $('sSpins').textContent = stats.spins.free + stats.spins.paid;
     $('sSpins').title = `免费 ${stats.spins.free} / 付费 ${stats.spins.paid}`;
     $('sOrders').textContent = stats.paidOrders;
@@ -72,8 +73,16 @@
 
     const list = $('list');
     list.textContent = '';
+    if (scope === 'open' && pendingCount) {
+      list.append(
+        el('p', {
+          className: 'muted',
+          textContent: `另有 ${pendingCount} 笔待付款订单：用户还没点「我已付款」，30 分钟内没点会自动失效，一般不用管。`,
+        })
+      );
+    }
     if (!orders.length) {
-      list.append(el('div', { className: 'empty', textContent: scope === 'open' ? '没有待处理的订单 🎉' : '还没有订单' }));
+      list.append(el('div', { className: 'empty', textContent: scope === 'open' ? '没有需要确认的订单 🎉' : '还没有订单' }));
       return;
     }
     for (const o of orders) {
@@ -127,7 +136,7 @@
       $('login').hidden = true;
       $('panel').hidden = false;
     } catch (e) {
-      if (e.code === 'bad_token' || e.code === 'admin_disabled') {
+      if (e.code === 'bad_token' || e.code === 'admin_disabled' || e.code === 'admin_locked') {
         clearInterval(timer);
         $('panel').hidden = true;
         $('login').hidden = false;
